@@ -15,9 +15,9 @@ const HEADERS = {
 
 const manifest = {
   id: 'community.rezka.stremio',
-  version: '1.0.0',
+  version: '1.1.0',
   name: 'Rezka',
-  description: 'Фильмы и сериалы с rezka.ag — русская озвучка, субтитры',
+  description: 'Фильмы и сериалы с rezka.ag — русская озвучка',
   logo: 'https://rezka.ag/templates/hdrezka/images/hdrezka-logo.png',
   resources: ['catalog', 'meta', 'stream'],
   types: ['movie', 'series'],
@@ -42,38 +42,41 @@ const builder = new addonBuilder(manifest);
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-// Decode rezka stream URLs (they use a simple obfuscation)
+// ID format: rezka:BASE64_ENCODED_URL
+// This way we always know the exact URL to fetch
+
+function makeId(url) {
+  return 'rezka:' + Buffer.from(url).toString('base64').replace(/=/g, '');
+}
+
+function parseId(id) {
+  const encoded = id.replace('rezka:', '');
+  // Add padding back
+  const padded = encoded + '=='.slice(0, (4 - encoded.length % 4) % 4);
+  try {
+    return Buffer.from(padded, 'base64').toString('utf8');
+  } catch {
+    return null;
+  }
+}
+
 function decodeStreamUrls(encoded) {
   if (!encoded) return '';
-  // Step 1: replace trash characters
-  let decoded = encoded
-    .replace(/\/\//g, '')
-    .replace(/#h/g, '//')
-    .replace(/\^/g, '0');
-
-  // Step 2: decode base64 chunks separated by /
+  let decoded = encoded.replace(/\/\//g, '').replace(/#h/g, '//').replace(/\^/g, '0');
   try {
     const parts = decoded.split('/');
     const result = parts.map(part => {
-      try {
-        return Buffer.from(part, 'base64').toString('utf8');
-      } catch {
-        return part;
-      }
+      try { return Buffer.from(part, 'base64').toString('utf8'); } catch { return part; }
     });
     const joined = result.join('/');
     if (joined.includes('http')) return joined;
   } catch {}
-
   return decoded;
 }
 
-// Parse quality + URL pairs from decoded stream string
-// Format: "1080p:url1 or url2,720p:url3 or url4,..."
 function parseQualities(streamsStr) {
   const results = [];
   if (!streamsStr) return results;
-
   const pairs = streamsStr.split(',');
   for (const pair of pairs) {
     const colonIdx = pair.indexOf(':');
@@ -82,37 +85,20 @@ function parseQualities(streamsStr) {
     const urlsPart = pair.substring(colonIdx + 1).trim();
     const urls = urlsPart.split(' or ').map(u => u.trim()).filter(u => u.startsWith('http'));
     if (urls.length > 0) {
-      results.push({ quality, url: urls[urls.length - 1] }); // prefer last (usually best mirror)
+      results.push({ quality, url: urls[urls.length - 1] });
     }
   }
   return results;
 }
 
-// Fetch HTML from rezka
 async function fetchPage(url) {
-  const resp = await axios.get(url, { headers: HEADERS, timeout: 10000 });
+  const resp = await axios.get(url, { headers: HEADERS, timeout: 15000 });
   return resp.data;
 }
 
-// Search rezka.ag
-async function searchRezka(query, type) {
-  const typeParam = type === 'movie' ? 'films' : 'series';
-  const url = `${BASE_URL}/search/?do=search&subaction=search&q=${encodeURIComponent(query)}`;
-  const html = await fetchPage(url);
-  return parseSearchResults(html, type);
-}
+// ─── Parse catalog results ───────────────────────────────────────────────────
 
-// Get main page items (catalog without search)
-async function getCatalog(type, skip = 0) {
-  const page = Math.floor(skip / 36) + 1;
-  const section = type === 'movie' ? 'films' : 'series';
-  const url = `${BASE_URL}/${section}/page/${page}/`;
-  const html = await fetchPage(url);
-  return parseSearchResults(html, type);
-}
-
-// Parse search/catalog results HTML
-function parseSearchResults(html, type) {
+function parseResults(html, type) {
   const $ = cheerio.load(html);
   const items = [];
 
@@ -126,71 +112,68 @@ function parseSearchResults(html, type) {
 
     if (!href || !title) return;
 
-    // Extract ID from URL
-    const idMatch = href.match(/\/(\d+)-/);
-    if (!idMatch) return;
-    const rezkaId = idMatch[1];
-
-    // Detect type from URL
     const isMovie = href.includes('/films/') || href.includes('/cartoons/') || href.includes('/animation/');
     const isSeries = href.includes('/series/') || href.includes('/cartoons-series/');
 
     if (type === 'movie' && !isMovie) return;
     if (type === 'series' && !isSeries) return;
 
+    const fullUrl = href.startsWith('http') ? href : BASE_URL + href;
+
     items.push({
-      id: `rezka:${rezkaId}`,
+      id: makeId(fullUrl),
       type,
       name: title,
       poster: img,
       year: year ? parseInt(year) : undefined,
-      rezkaUrl: href,
     });
   });
 
   return items;
 }
 
-// Get page info for meta
-async function getPageInfo(rezkaUrl) {
-  const html = await fetchPage(rezkaUrl);
+// ─── Get page details ────────────────────────────────────────────────────────
+
+async function getPageInfo(url) {
+  const html = await fetchPage(url);
   const $ = cheerio.load(html);
 
   const title = $('h1[itemprop="name"]').text().trim() || $('h1').first().text().trim();
   const poster = $('.b-sidecover img').attr('src') || '';
   const description = $('[itemprop="description"]').text().trim();
   const year = $('[itemprop="dateCreated"]').text().trim() || '';
-  const rating = $('[itemprop="ratingValue"]').text().trim() || '';
 
-  // Get translators
   const translators = [];
   $('#translators-list li').each((i, el) => {
     const $el = $(el);
-    translators.push({
-      id: $el.attr('data-translator_id'),
-      name: $el.text().trim(),
-    });
+    const tid = $el.attr('data-translator_id');
+    const tname = $el.text().trim();
+    if (tid) translators.push({ id: tid, name: tname });
   });
 
-  // Get movie/series ID from page
-  const movieId = $('#player').attr('data-id') ||
-    html.match(/sof\.tv\.initCDN[A-Za-z]*\s*\(\s*(\d+)/)?.[1] || '';
+  // Get movie ID from page scripts
+  let movieId = $('#player').attr('data-id') || '';
+  if (!movieId) {
+    const match = html.match(/initCDN\w*\s*\(\s*(\d+)/);
+    if (match) movieId = match[1];
+  }
+  if (!movieId) {
+    const match = html.match(/"id_movie"\s*:\s*(\d+)/);
+    if (match) movieId = match[1];
+  }
 
-  // Get seasons/episodes for series
-  const seasons = [];
-  $('.b-simple_seasons__item').each((i, el) => {
-    const $el = $(el);
-    seasons.push({
-      id: $el.attr('data-tab_id'),
-      name: $el.text().trim(),
-    });
-  });
+  // Also try to get translator from inline script
+  if (translators.length === 0) {
+    const match = html.match(/translator_id\s*[:=]\s*(\d+)/);
+    if (match) translators.push({ id: match[1], name: 'Перевод' });
+  }
 
-  return { title, poster, description, year, rating, translators, movieId, seasons };
+  return { title, poster, description, year, translators, movieId };
 }
 
-// Fetch stream URLs from rezka AJAX endpoint
-async function fetchStreams(movieId, translatorId, season = null, episode = null, isSeries = false) {
+// ─── Fetch streams ───────────────────────────────────────────────────────────
+
+async function fetchStreams(movieId, translatorId, season, episode, isSeries) {
   const postData = new URLSearchParams();
   postData.append('id', movieId);
   postData.append('translator_id', translatorId);
@@ -203,34 +186,43 @@ async function fetchStreams(movieId, translatorId, season = null, episode = null
     postData.append('action', 'get_movie');
   }
 
-  const resp = await axios.post(`${BASE_URL}/ajax/get_cdn_series/`, postData, {
-    headers: {
-      ...HEADERS,
-      'Content-Type': 'application/x-www-form-urlencoded',
-      'X-Requested-With': 'XMLHttpRequest',
-    },
-    timeout: 10000,
-  });
+  try {
+    const resp = await axios.post(`${BASE_URL}/ajax/get_cdn_series/`, postData, {
+      headers: {
+        ...HEADERS,
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'X-Requested-With': 'XMLHttpRequest',
+      },
+      timeout: 15000,
+    });
 
-  const data = resp.data;
-  if (!data.success) return [];
+    const data = resp.data;
+    if (!data.success) return [];
 
-  const rawUrls = data.url || data.streams || '';
-  const decoded = decodeStreamUrls(rawUrls);
-  return parseQualities(decoded);
+    const rawUrls = data.url || data.streams || '';
+    const decoded = decodeStreamUrls(rawUrls);
+    return parseQualities(decoded);
+  } catch (err) {
+    console.error('fetchStreams error:', err.message);
+    return [];
+  }
 }
 
 // ─── Catalog Handler ──────────────────────────────────────────────────────────
 
 builder.defineCatalogHandler(async ({ type, id, extra }) => {
-  console.log(`Catalog request: type=${type}, id=${id}, extra=`, extra);
+  console.log(`Catalog: type=${type}, search=${extra.search || ''}, skip=${extra.skip || 0}`);
   try {
-    let metas;
+    let html;
     if (extra.search) {
-      metas = await searchRezka(extra.search, type);
+      const url = `${BASE_URL}/search/?do=search&subaction=search&q=${encodeURIComponent(extra.search)}`;
+      html = await fetchPage(url);
     } else {
-      metas = await getCatalog(type, extra.skip || 0);
+      const page = Math.floor((extra.skip || 0) / 36) + 1;
+      const section = type === 'movie' ? 'films' : 'series';
+      html = await fetchPage(`${BASE_URL}/${section}/page/${page}/`);
     }
+    const metas = parseResults(html, type);
     return { metas };
   } catch (err) {
     console.error('Catalog error:', err.message);
@@ -241,50 +233,25 @@ builder.defineCatalogHandler(async ({ type, id, extra }) => {
 // ─── Meta Handler ─────────────────────────────────────────────────────────────
 
 builder.defineMetaHandler(async ({ type, id }) => {
-  console.log(`Meta request: type=${type}, id=${id}`);
+  console.log(`Meta: type=${type}, id=${id}`);
   if (!id.startsWith('rezka:')) return { meta: null };
 
+  const url = parseId(id);
+  if (!url) return { meta: null };
+
   try {
-    // We need the URL — search for it
-    const rezkaId = id.replace('rezka:', '');
-    // Try to construct URL (works for most cases)
-    const searchUrl = `${BASE_URL}/search/?do=search&subaction=search&q=${rezkaId}`;
-    const html = await fetchPage(searchUrl);
-    const $ = cheerio.load(html);
-
-    let rezkaUrl = '';
-    $('.b-content__inline_item').each((i, el) => {
-      const href = $(el).find('.b-content__inline_item-link a').attr('href') || '';
-      if (href.includes(`/${rezkaId}-`)) {
-        rezkaUrl = href;
-        return false;
+    const info = await getPageInfo(url);
+    return {
+      meta: {
+        id,
+        type,
+        name: info.title || 'Без названия',
+        poster: info.poster,
+        description: info.description,
+        year: info.year ? parseInt(info.year) : undefined,
+        background: info.poster,
       }
-    });
-
-    if (!rezkaUrl) return { meta: null };
-
-    const info = await getPageInfo(rezkaUrl);
-
-    const meta = {
-      id,
-      type,
-      name: info.title,
-      poster: info.poster,
-      description: info.description,
-      year: info.year ? parseInt(info.year) : undefined,
-      imdbRating: info.rating || undefined,
-      background: info.poster,
     };
-
-    // Add videos for series
-    if (type === 'series' && info.seasons.length > 0 && info.translators.length > 0) {
-      // We'll add basic season/episode structure
-      meta.videos = [];
-      // Note: Full episode list requires additional AJAX calls per season
-      // This is a simplified version
-    }
-
-    return { meta };
   } catch (err) {
     console.error('Meta error:', err.message);
     return { meta: null };
@@ -294,82 +261,70 @@ builder.defineMetaHandler(async ({ type, id }) => {
 // ─── Stream Handler ───────────────────────────────────────────────────────────
 
 builder.defineStreamHandler(async ({ type, id }) => {
-  console.log(`Stream request: type=${type}, id=${id}`);
+  console.log(`Stream: type=${type}, id=${id}`);
   if (!id.startsWith('rezka:')) return { streams: [] };
 
+  // ID might contain season/episode: rezka:BASE64:season:episode
+  const parts = id.split(':');
+  const encodedUrl = parts[1];
+  const season = parts[2] || null;
+  const episode = parts[3] || null;
+
+  const padded = encodedUrl + '=='.slice(0, (4 - encodedUrl.length % 4) % 4);
+  let url;
   try {
-    const parts = id.replace('rezka:', '').split(':');
-    const rezkaId = parts[0];
-    const season = parts[1] || null;
-    const episode = parts[2] || null;
-    const isSeries = type === 'series' && season && episode;
+    url = Buffer.from(padded, 'base64').toString('utf8');
+  } catch {
+    return { streams: [] };
+  }
 
-    // Find the page URL
-    const searchUrl = `${BASE_URL}/search/?do=search&subaction=search&q=${rezkaId}`;
-    const html = await fetchPage(searchUrl);
-    const $ = cheerio.load(html);
+  const isSeries = type === 'series' && season && episode;
 
-    let rezkaUrl = '';
-    $('.b-content__inline_item').each((i, el) => {
-      const href = $(el).find('.b-content__inline_item-link a').attr('href') || '';
-      if (href.includes(`/${rezkaId}-`)) {
-        rezkaUrl = href;
-        return false;
-      }
-    });
-
-    if (!rezkaUrl) return { streams: [] };
-
-    const info = await getPageInfo(rezkaUrl);
-    if (!info.movieId) return { streams: [] };
+  try {
+    const info = await getPageInfo(url);
+    if (!info.movieId) {
+      console.log('No movie ID found for:', url);
+      return { streams: [] };
+    }
 
     const streams = [];
-    const translatorId = info.translators[0]?.id || '1';
 
-    const qualities = await fetchStreams(
-      info.movieId,
-      translatorId,
-      season,
-      episode,
-      isSeries
-    );
+    // Try first translator
+    const translatorId = info.translators[0]?.id || '1';
+    const qualities = await fetchStreams(info.movieId, translatorId, season, episode, isSeries);
 
     for (const q of qualities) {
       streams.push({
         url: q.url,
         name: `Rezka ${q.quality}`,
         title: info.translators[0]?.name || 'Дубляж',
-        behaviorHints: { notWebReady: false },
       });
     }
 
-    // If multiple translators available, fetch for each (optional, first one is usually best)
-    if (info.translators.length > 1 && streams.length === 0) {
-      for (const translator of info.translators.slice(0, 3)) {
-        if (!translator.id) continue;
+    // If no streams from first, try other translators
+    if (streams.length === 0 && info.translators.length > 1) {
+      for (const translator of info.translators.slice(1, 4)) {
         const qs = await fetchStreams(info.movieId, translator.id, season, episode, isSeries);
         for (const q of qs) {
           streams.push({
             url: q.url,
             name: `${q.quality}`,
             title: translator.name,
-            behaviorHints: { notWebReady: false },
           });
         }
+        if (streams.length > 0) break;
       }
     }
 
     console.log(`Found ${streams.length} streams`);
     return { streams };
-
   } catch (err) {
     console.error('Stream error:', err.message);
     return { streams: [] };
   }
 });
 
-// ─── Start Server ─────────────────────────────────────────────────────────────
+// ─── Start ────────────────────────────────────────────────────────────────────
 
 serveHTTP(builder.getInterface(), { port: PORT });
-console.log(`Rezka Stremio Addon running on port ${PORT}`);
-console.log(`Add to Stremio: http://YOUR_SERVER_IP:${PORT}/manifest.json`);
+console.log(`Rezka addon running on port ${PORT}`);
