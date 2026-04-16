@@ -55,72 +55,53 @@ function parseId(id) {
 
 // ─── Rezka stream URL decoder ─────────────────────────────────────────────────
 
-function clearTrash(str) {
-  // Remove trash substrings inserted by rezka obfuscation
-  const trashList = ['@#&', '!$^', '#', '@#^', '!@#'];
-  let result = str;
-  for (const trash of trashList) {
-    result = result.split(trash).join('');
+function decodeSegment(segment) {
+  // Strip all non-base64 characters (trash inserted by rezka)
+  const clean = segment.replace(/[^A-Za-z0-9+/=]/g, '');
+  if (!clean) return '';
+  try {
+    const decoded = Buffer.from(clean, 'base64').toString('latin1');
+    // Accept only printable ASCII (valid URL characters); reject garbage
+    if (decoded.length > 0 && /^[\x20-\x7E]+$/.test(decoded)) {
+      return decoded;
+    }
+    return segment;
+  } catch {
+    return segment;
   }
-  return result;
 }
 
-function decodeRezkaUrl(encoded) {
-  if (!encoded) return '';
-  // Step 1: replace #h back to //
-  let str = encoded.replace(/#h/g, '//');
-  // Step 2: split by //, decode each base64 segment, rejoin
-  const parts = str.split('//');
-  const decoded = parts.map(p => {
-    const clean = clearTrash(p);
-    try {
-      const result = Buffer.from(clean, 'base64').toString('utf8');
-      // Check if decoded looks like a URL path
-      if (result && (result.startsWith('/') || result.startsWith('http') || result.includes('.'))) {
-        return result;
-      }
-      return p;
-    } catch {
-      return p;
-    }
-  });
-  return decoded.join('//');
+function decodeStreamUrl(encodedUrl) {
+  if (!encodedUrl) return '';
+  // #h represents / in the encoded form; decode each segment and rejoin with /
+  return encodedUrl.split('#h').map(decodeSegment).join('/');
 }
 
 function parseStreams(rawUrl) {
-  // Format: [720p]url1 or url2,[1080p]url3 or url4
+  // Format: [720p]encodedUrl or encodedUrl,[1080p]encodedUrl or encodedUrl
   const streams = [];
   if (!rawUrl) return streams;
 
-  // Split by comma but be careful — commas can appear in URLs
-  // Format is: QUALITY:url1 or url2,QUALITY:url1 or url2
   const qualityPattern = /\[([^\]]+)\](.*?)(?=,\[|$)/g;
   let match;
 
   while ((match = qualityPattern.exec(rawUrl)) !== null) {
     const quality = match[1];
     const urlsPart = match[2].trim();
-    const urls = urlsPart.split(' or ').map(u => u.trim()).filter(u => u.length > 0);
-    const bestUrl = urls[urls.length - 1]; // last is usually best mirror
-    if (bestUrl) {
-      streams.push({ quality, url: bestUrl });
+    const encodedUrls = urlsPart.split(' or ').map(u => u.trim()).filter(Boolean);
+    const bestEncoded = encodedUrls[encodedUrls.length - 1]; // last is usually best mirror
+    if (!bestEncoded) continue;
+
+    const url = decodeStreamUrl(bestEncoded);
+    console.log(`  [${quality}] decoded: ${url.substring(0, 80)}`);
+    if (url.startsWith('http')) {
+      streams.push({ quality, url });
     }
   }
 
-  // Fallback: old format without brackets
-  if (streams.length === 0) {
-    const parts = rawUrl.split(',');
-    for (const part of parts) {
-      const colonIdx = part.indexOf(':http');
-      if (colonIdx > 0) {
-        const quality = part.substring(0, colonIdx).trim();
-        const urlsPart = part.substring(colonIdx + 1).trim();
-        const urls = urlsPart.split(' or ').map(u => u.trim()).filter(u => u.startsWith('http'));
-        if (urls.length > 0) {
-          streams.push({ quality, url: urls[urls.length - 1] });
-        }
-      }
-    }
+  // Fallback: plain URL with no quality markers
+  if (streams.length === 0 && rawUrl.startsWith('http')) {
+    streams.push({ quality: 'auto', url: rawUrl });
   }
 
   return streams;
@@ -248,11 +229,7 @@ async function fetchCDNStreams(movieId, translatorId, season, episode, isSeries)
   const rawUrl = data.url || '';
   console.log(`Raw URL (first 200): ${rawUrl.substring(0, 200)}`);
 
-  // Decode the obfuscated URL
-  const decodedUrl = decodeRezkaUrl(rawUrl);
-  console.log(`Decoded URL (first 200): ${decodedUrl.substring(0, 200)}`);
-
-  return parseStreams(decodedUrl);
+  return parseStreams(rawUrl);
 }
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────
